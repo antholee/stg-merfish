@@ -1,0 +1,479 @@
+
+#remotes::install_github(repo = 'alikhuseynov/seurat', ref = 'feat/vizgen')
+
+
+
+#remove.packages("Seurat")
+#remotes::install_github("satijalab/seurat", ref = "seurat5")
+
+#https://github.com/satijalab/seurat/issues/4896
+
+library(Seurat)
+library(SeuratWrappers)
+library(ggplot2)
+library(dplyr)
+library(magrittr)
+library(BiocParallel)
+library(progressr)
+library(sfarrow)
+library(spatstat)    
+library(sf)
+library(future)
+library(data.table)
+library(arrow)
+library(scales) 
+library(parallel)
+library(doParallel)
+library(reticulate)
+library(patchwork)
+library(viridis)
+today_date <- format(Sys.Date(), "%Y%m%d")
+options(future.globals.maxSize= 8912896000)
+plan("multisession", workers = 8)
+plan(future.seed=TRUE)
+
+## load filtered list of MERFISH seurat objects ----
+MERFISH.list <- readRDS("XXX")
+
+## SCT normalize each MERFISH dataset ----
+SCT.MERFISH.list <- lapply(X = MERFISH.list, 
+                           FUN = SCTransform, 
+                           assay = 'Vizgen', 
+                           vars.to.regress = 'volume',
+                           clip.range = c(-10, 10),
+                           vst.flavor='v2')
+var.features <- SelectIntegrationFeatures(object.list = SCT.MERFISH.list, nfeatures = 3000)
+
+
+## merge datasets ----
+sample_names <- names(SCT.MERFISH.list)
+n_samples <- length(sample_names)
+list_samples <- c(SCT.MERFISH.list[2:n_samples])
+plan("sequential")
+allTG.combined <- merge(x=SCT.MERFISH.list[[1]], y = list_samples, add.cell.ids = c(sample_names), merge.data=TRUE)
+regionID <- allTG.combined@assays[["Vizgen"]]@counts@Dimnames[[2]]
+
+# Use strsplit to split each element at the "_" character and extract the first part
+plan("multisession", workers = 10)
+plan(future.seed=TRUE)
+substrings <- sapply(regionID, function(x) {
+  parts <- strsplit(x, "_")[[1]]
+  if (length(parts) > 0) {
+    return(parts[1])
+  } else {
+    return(NA)
+  }
+})
+
+allTG.combined$cortical_region <- gsub("\\d.*", "", regionID)
+allTG.combined$replicate <- substrings
+
+
+filename <- paste0("XXX")
+#saveRDS(allTG.combined, file = filename)
+
+SCT.merged_MERFISH <- readRDS(filename)
+
+
+## pre-integration analysis ----
+VariableFeatures(SCT.merged_MERFISH) <- var.features
+
+
+#do PCA/UMAP on pre-integrated data
+SCT.merged_MERFISH <- RunPCA(SCT.merged_MERFISH, npcs = 30, verbose = TRUE, reduction.name = 'pca.unintegrated')
+SCT.merged_MERFISH <- RunUMAP(SCT.merged_MERFISH, reduction = "pca.unintegrated", dims = 1:30, reduction.name = 'umap.unintegrated')
+
+
+## integrate datasets with RunHarmony ----
+
+#https://github.com/YiZhang-lab/PFC-MERFISH/blob/main/run_merFISH_pipeline.R
+#harmony
+require(harmony)
+harmony_MERFISH <- RunHarmony(
+  object = SCT.merged_MERFISH,
+  reduction = "pca.unintegrated",
+  reduction.save = "pca.runharmony",
+  group.by.vars = 'replicate',
+  assay.use = "SCT",
+  dims.use = 1:30,
+  plot_convergence = TRUE
+)
+
+rm(SCT.merged_MERFISH)
+
+## UMAP of Harmony integrated datasets ----
+harmony_MERFISH <- RunUMAP(harmony_MERFISH, reduction = "pca.runharmony", dims = 1:30, reduction.name = 'umap.runharmony', min.dist = 0.1)
+
+#plot UMAPS and PCs pre and post integration
+p1 <- DimPlot(harmony_MERFISH, reduction = "umap.unintegrated", group.by = "replicate", pt.size = 0.001, label = FALSE, raster=FALSE) 
+p2 <- DimPlot(harmony_MERFISH, reduction = "umap.runharmony", group.by = "replicate", pt.size = 0.001, label = FALSE, raster=FALSE)
+p1+p2 + labs(title = "UMAPs pre and post-Harmony integration")
+
+p1 <- DimPlot(harmony_MERFISH, reduction = "pca.unintegrated", group.by = "replicate", pt.size = 0.001, dims = c(1, 2), raster=FALSE)
+p2 <- DimPlot(harmony_MERFISH, reduction = "pca.runharmony", group.by = "replicate", pt.size = 0.001, dims = c(1, 2), raster=FALSE)
+p1+p2 + labs(title = "PCs pre and post-Harmony integration")
+
+#remove volume outlier ----
+abs_volume_outlier = quantile(harmony_MERFISH$volume, probs = c(0.98))
+FeaturePlot(subset(harmony_MERFISH, subset = volume > abs_volume_outlier[[1]]), reduction = 'umap.runharmony', raster=FALSE, features = "volume")
+harmony_MERFISH <- subset(x = harmony_MERFISH, volume < abs_volume_outlier[[1]]) #411351 to 403123 for volume < 98tile
+VlnPlot(object = harmony_MERFISH, features = c('nCount_SCT', "nFeature_SCT"), pt.size = -1)
+
+
+## initial clustering ----
+harmony_MERFISH <- FindNeighbors(harmony_MERFISH, reduction = "pca.runharmony", dims = 1:30)
+harmony_MERFISH <- FindClusters(harmony_MERFISH, 
+                                algorithm = 2, 
+                                resolution = 0.6, 
+                                group.singletons = FALSE,
+                                verbose = TRUE)
+
+DimPlot(harmony_MERFISH, reduction = "umap.runharmony", group.by = "seurat_clusters", pt.size = 0.001, raster = FALSE) + ggtitle('resolution 0.6')
+
+
+## subset1: remove singletons, clusters < 100 ----
+
+# remove cell cluster that contains less than 100 cells
+cluster_select = table(harmony_MERFISH$seurat_clusters)
+cluster_select = cluster_select[cluster_select > 100]
+# remove singleton
+cluster_select = cluster_select[names(cluster_select) != "singleton"]
+harmony_MERFISH = subset(harmony_MERFISH, idents = names(cluster_select)) 
+
+MERFISH.subset1 <- SCTransform(harmony_MERFISH, assay = 'Vizgen', clip.range = c(-10, 10), 
+                               vars.to.regress = 'volume', vst.flavor='v2')
+MERFISH.subset1 <- RunPCA(MERFISH.subset1, npcs = 30, verbose = TRUE, reduction.name = 'pca.sub1_unintegrated')
+MERFISH.subset1 <- RunUMAP(MERFISH.subset1, reduction = "pca.sub1_unintegrated", dims = 1:30, reduction.name = 'umap.sub1_unintegrated')
+
+MERFISH.subset1 <- RunHarmony(
+  object = MERFISH.subset1,
+  reduction = "pca.sub1_unintegrated",
+  reduction.save = "pca.sub1_harmony",
+  group.by.vars = 'replicate',
+  assay.use = "SCT",
+  dims.use = 1:30,-
+  plot_convergence = TRUE
+)
+
+MERFISH.subset1 <- RunUMAP(MERFISH.subset1, reduction = "pca.sub1_harmony", dims = 1:30, reduction.name = 'umap.sub1_runharmony', min.dist = 0.1)
+MERFISH.subset1 <- FindNeighbors(MERFISH.subset1, reduction = "pca.sub1_harmony", dims = 1:30)
+MERFISH.subset1 <- FindClusters(MERFISH.subset1, algorithm = 2, resolution = 0.6, verbose = TRUE)
+
+## annotation: finding anchor data from reference ----
+# output from "~/Dropbox/Lab/Seurat/make Allen MTG reference.R"
+reference.MTG <- readRDS('~/Dropbox/Lab/MERFISH/referenceMTG-postSCTransform.rds')
+
+
+##find anchor cells between reference and experimental integrated TG datasets
+TG.anchors <- FindTransferAnchors(reference = reference.MTG, query = allMERFISH, normalization.method = "SCT", reduction = "pcaproject", 
+                                  dims = 1:30, reference.reduction = NULL, query.assay = "SCT")
+
+predictions <- TransferData(anchorset = TG.anchors, refdata = reference.MTG$subclass_label, dims = 1:30)
+allMERFISH <- AddMetaData(allMERFISH, metadata = predictions)
+
+## plot UMAP of integrated TG dataset with the subclass label transferred from anchor cells----
+p1 <- DimPlot(allMERFISH, reduction = "umap.sub1_runharmony", group.by = "seurat_clusters", repel = TRUE, label = TRUE, raster = FALSE) 
+p2 <- DimPlot(allMERFISH, reduction = "umap.sub1_runharmony", group.by = "predicted.id", repel = TRUE, label = TRUE, raster = FALSE) 
+p1+p2+ggtitle('all data, min dist 0.1, resolution 0.6')
+
+## subset 2: remove clusters with FindAllMarkers----
+#allMERFISH <- PrepSCTFindMarkers(allMERFISH, assay = "SCT", verbose = TRUE)
+MERFISH.markers <- FindAllMarkers(allMERFISH, logfc.threshold = 1,  min.pct = 0.75, min.diff.pct = 0.5, only.pos = TRUE)
+
+cluster_select <- as.character(unique(MERFISH.markers$cluster))
+allMERFISH.subset2 = subset(allMERFISH, idents = cluster_select) #(removed cluster 0)
+
+## re-SCT, PCA, harmony, etc ----
+
+MERFISH.subset2 <- SCTransform(allMERFISH.subset2, assay = 'Vizgen', clip.range = c(-10, 10), 
+                               vars.to.regress = 'volume', vst.flavor='v2')
+MERFISH.subset2 <- RunPCA(MERFISH.subset2, npcs = 30, verbose = TRUE, reduction.name = 'pca.sub2_unintegrated')
+MERFISH.subset2 <- RunUMAP(MERFISH.subset2, reduction = "pca.sub2_unintegrated", dims = 1:30, reduction.name = 'umap.sub2_unintegrated')
+
+require(harmony)
+MERFISH.subset2 <- RunHarmony(
+  object = MERFISH.subset2,
+  reduction = "pca.sub2_unintegrated",
+  reduction.save = "pca.sub2_harmony",
+  group.by.vars = 'replicate',
+  assay.use = "SCT",
+  dims.use = 1:30,
+  plot_convergence = TRUE
+)
+
+MERFISH.subset2 <- RunUMAP(MERFISH.subset2, reduction = "pca.sub2_harmony", dims = 1:30, reduction.name = 'umap.sub2_runharmony', min.dist = 0.1)
+MERFISH.subset2 <- FindNeighbors(MERFISH.subset2, reduction = "pca.sub2_harmony", dims = 1:30)
+MERFISH.subset2 <- FindClusters(MERFISH.subset2, algorithm = 2, resolution = 0.6, verbose = TRUE)
+
+TG.anchors <- FindTransferAnchors(reference = reference.MTG, query = MERFISH.subset2, normalization.method = "SCT", reduction = "pcaproject", 
+                                  dims = 1:30, reference.reduction = NULL, query.assay = "SCT")
+
+predictions <- TransferData(anchorset = TG.anchors, refdata = reference.MTG$subclass_label, dims = 1:30)
+MERFISH.subset2 <- AddMetaData(MERFISH.subset2, metadata = predictions)
+
+
+MERFISH_subset2.markers <- FindAllMarkers(MERFISH.subset2, logfc.threshold = 1.0, min.pct = 0.75, min.diff.pct = 0.5, only.pos = TRUE)
+subset2_cluster_select <- as.character(unique(MERFISH_subset2.markers$cluster))
+allMERFISH.subset3 = subset(MERFISH.subset2, idents = subset2_cluster_select) #(removed cluster 22)
+
+##subset 3 ----
+
+MERFISH.subset3 <- SCTransform(allMERFISH.subset3, assay = 'Vizgen', clip.range = c(-10, 10), 
+                               vars.to.regress = 'volume', vst.flavor='v2')
+MERFISH.subset3 <- RunPCA(MERFISH.subset3, npcs = 30, verbose = TRUE, reduction.name = 'pca.sub3_unintegrated')
+MERFISH.subset3 <- RunUMAP(MERFISH.subset3, reduction = "pca.sub3_unintegrated", dims = 1:30, reduction.name = 'umap.sub3_unintegrated')
+
+require(harmony)
+MERFISH.subset3 <- RunHarmony(
+  object = MERFISH.subset3,
+  reduction = "pca.sub3_unintegrated",
+  reduction.save = "pca.sub3_harmony",
+  group.by.vars = 'replicate',
+  assay.use = "SCT",
+  dims.use = 1:30,
+  plot_convergence = TRUE
+)
+
+MERFISH.subset3 <- RunUMAP(MERFISH.subset3, reduction = "pca.sub3_harmony", dims = 1:30, reduction.name = 'umap.sub3_runharmony', min.dist = 0.1)
+MERFISH.subset3 <- FindNeighbors(MERFISH.subset3, reduction = "pca.sub3_harmony", dims = 1:30)
+MERFISH.subset3 <- FindClusters(MERFISH.subset3, algorithm = 2, resolution = 0.6, verbose = TRUE)
+
+TG.anchors <- FindTransferAnchors(reference = reference.MTG, query = MERFISH.subset3, normalization.method = "SCT", reduction = "pcaproject", 
+                                  dims = 1:30, reference.reduction = NULL, query.assay = "SCT")
+
+
+predictions <- TransferData(anchorset = TG.anchors, refdata = reference.MTG$subclass_label, dims = 1:30)
+MERFISH.subset3 <- AddMetaData(MERFISH.subset3, metadata = predictions)
+
+
+MERFISH_subset3.markers <- FindAllMarkers(MERFISH.subset3, logfc.threshold = 1, min.pct = 0.75, min.diff.pct = 0.5, only.pos = TRUE)
+subset3_cluster_select <- as.character(unique(MERFISH_subset3.markers$cluster))
+
+##subset3 prediction score > 0.8 ----
+MERFISH.subset3.pred80 <- subset(x = MERFISH.subset3, subset = prediction.score.max > 0.8) 
+
+
+FeaturePlot(object = MERFISH.subset3.pred80,
+            features = c("nCount_SCT", "nFeature_SCT", "volume"),
+            reduction = 'umap.sub3_runharmony',
+            pt.size = .001,
+            raster=FALSE) 
+
+
+MERFISH_subset3pred80.markers <- FindAllMarkers(MERFISH.subset3.pred80, logfc.threshold = 1, min.pct = 0.75, min.diff.pct = 0.5, only.pos = TRUE)
+subset3pred80_cluster_select <- as.character(unique(MERFISH_subset3pred80.markers$cluster))
+
+
+
+# Convert metadata to factor
+# MERFISH.subset1.pred80@meta.data$cortical_region <- as.factor(MERFISH.subset1.pred80@meta.data$cortical_region)
+# MERFISH.subset1.pred80@meta.data$predicted.id <- as.char(MERFISH.subset1.pred80@meta.data$predicted.id)
+
+## add cell type CT metadata column----
+
+MERFISH$CT = as.character(MERFISH$predicted.id)
+
+MERFISH$CT[MERFISH$CT %in% c("Astrocyte", "VLMC", "Microglia-PVM", "OPC", "Oligodendrocyte")] <- "Non-neuron"
+MERFISH$CT[MERFISH$CT %in% c("Chandelier", "Vip", "Pvalb", "Sst", "Sncg", "Pax6", "Lamp5", "Lamp5 Lhx6")] <- "Inhibitory"
+MERFISH$CT[!MERFISH$CT %in% c("Non-neuron", "Inhibitory")] <- "Excitatory"
+
+# Convert metadata to character
+# MERFISH.subset1.pred80@meta.data$cortical_region <- as.character(MERFISH.subset1.pred80@meta.data$cortical_region)
+# MERFISH.subset1.pred80@meta.data$predicted.id <- as.character(MERFISH.subset1.pred80@meta.data$predicted.id)
+
+## calculate total # of cells per region ----
+
+# Create the table of all cells per cortical region
+table_result <- table(MERFISH@meta.data$cortical_region)
+# Convert the table to a data frame for better visualization
+table.ncells.byRegion <- as.data.frame(table_result)
+# Rename the columns for clarity
+colnames(table.ncells.byRegion) <- c("Cortical Region", "Cell Count")
+# Print the table
+print(table.ncells.byRegion)
+
+## doughnut of ncells by region ----
+data <- data.frame(
+  category=c(table.ncells.byRegion$`Cortical Region`),
+  count=c(table.ncells.byRegion$`Cell Count`)
+)
+
+# Compute percentages
+data$fraction <- data$count / sum(data$count)
+
+# Compute the cumulative percentages (top of each rectangle)
+data$ymax <- cumsum(data$fraction)
+
+# Compute the bottom of each rectangle
+data$ymin <- c(0, head(data$ymax, n=-1))
+
+# Compute label position
+data$labelPosition <- (data$ymax + data$ymin) / 2
+
+# Compute a good label
+data$label <- paste0(data$category, "\n cells: ", data$count, " (", round(data$fraction,2)*100, "%)")
+
+# Make the plot
+ggplot(data, aes(ymax=ymax, ymin=ymin, xmax=4, xmin=3, fill=category)) +
+  geom_rect() +
+  geom_label( x=3.5, aes(y=labelPosition, label=label), size=6) +
+  scale_fill_brewer(palette="Set1") +
+  coord_polar(theta="y") +
+  xlim(c(2, 4)) +
+  theme_void() +
+  theme(legend.position = "none")
+
+
+## Create table of cell types per cortical region ----
+table_result <- table(MERFISH@meta.data$cortical_region, MERFISH@meta.data[["CT"]])
+# Convert the table to a data frame for better visualization
+table.celltypes.byRegion <- as.data.frame(table_result)
+# Rename the columns for clarity
+colnames(table.celltypes.byRegion) <- c("Cortical region", "Cell types", "Cell count")
+
+ggplot(table.celltypes.byRegion, aes(x = `Cortical region`, y = `Cell count`, fill = `Cell types`)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Cell Count by Cortical Region and Cell Types",
+       x = "Cortical Region", y = "Cell Count") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+## plot % of cell types per cortical region ----
+#Calculate the total cell count for each cortical region
+total_cell_count <- aggregate(`Cell count` ~ `Cortical region`, data = table.celltypes.byRegion, sum)
+# Merge the total cell count back to the original data frame
+table.celltypes.byRegion <- merge(table.celltypes.byRegion, total_cell_count, by = "Cortical region")
+# Calculate the percentage of cells for each cell type within each cortical region
+table.celltypes.byRegion$"% cells" <- with(table.celltypes.byRegion, (`Cell count.x` / `Cell count.y`) * 100)
+# Remove unnecessary columns
+table.celltypes.byRegion <- subset(table.celltypes.byRegion, select = -c(`Cell count.y`))
+# Print the updated data frame
+print(table.celltypes.byRegion)
+
+ggplot(table.celltypes.byRegion, aes(x = `Cortical region`, y = `% cells`, fill = `Cell types`)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Cell Count by Cortical Region and Cell Types",
+       x = "Cortical Region", y = "% cells per region") +  # Custom legend for cell types
+      geom_text(aes(label = paste0(round(`% cells`, 2), "%"), y = `% cells`, group = `Cell types`), 
+            position = position_stack(vjust = 0.5), size = 3) +  # Add % cells text labels
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+## create table of excitatory subtypes per cortical region ----
+subset.excitatory <- subset(MERFISH, subset = CT == 'Excitatory')
+table.excitatory <- table(subset.excitatory$cortical_region, subset.excitatory$predicted.id)
+# Convert the table to a data frame for better visualization
+table.excitatory.byRegion <- as.data.frame(table.excitatory)
+# Rename the columns for clarity
+colnames(table.excitatory.byRegion) <- c("Cortical region", "Cell types", "Cell count")
+
+## plot % of excitatory subtypes per cortical region ----
+total_cell_count <- aggregate(`Cell count` ~ `Cortical region`, data = table.excitatory.byRegion, sum)
+# Merge the total cell count back to the original data frame
+table.excitatory.byRegion <- merge(table.excitatory.byRegion, total_cell_count, by = "Cortical region")
+# Calculate the percentage of cells for each cell type within each cortical region
+table.excitatory.byRegion$"% cells" <- with(table.excitatory.byRegion, (`Cell count.x` / `Cell count.y`) * 100)
+# Remove unnecessary columns
+table.excitatory.byRegion <- subset(table.excitatory.byRegion, select = -c(`Cell count.y`))
+# Print the updated data frame
+print(table.excitatory.byRegion)
+
+ggplot(table.excitatory.byRegion, aes(x = `Cortical region`, y = `% cells`, fill = `Cell types`)) +
+  geom_bar(stat = "identity") +
+  scale_fill_discrete(name = "Cell types") +  # Custom legend for cell types
+  geom_text(aes(label = paste0(round(`% cells`, 2), "%"), y = `% cells`, group = `Cell types`), 
+            position = position_stack(vjust = 0.5), size = 3) +  # Add % cells text labels
+  labs(title = "Excitatory Neuron Subtypes by Cortical Region and Cell Types",
+       x = "Cortical Region", y = "% of excitatory neurons per region") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+## create table of inhibitory subtypes per cortical region ----
+subset.inhibitory <- subset(MERFISH, subset = CT == 'Inhibitory')
+table.inhibitory <- table(subset.inhibitory$cortical_region, subset.inhibitory$predicted.id)
+# Convert the table to a data frame for better visualization
+table.inhibitory.byRegion <- as.data.frame(table.inhibitory)
+# Rename the columns for clarity
+colnames(table.inhibitory.byRegion) <- c("Cortical region", "Cell types", "Cell count")
+
+
+## plot % of inhibitory subtypes per cortical region ----
+total_cell_count <- aggregate(`Cell count` ~ `Cortical region`, data = table.inhibitory.byRegion, sum)
+# Merge the total cell count back to the original data frame
+table.inhibitory.byRegion <- merge(table.inhibitory.byRegion, total_cell_count, by = "Cortical region")
+# Calculate the percentage of cells for each cell type within each cortical region
+table.inhibitory.byRegion$"% cells" <- with(table.inhibitory.byRegion, (`Cell count.x` / `Cell count.y`) * 100)
+# Remove unnecessary columns
+table.inhibitory.byRegion <- subset(table.inhibitory.byRegion, select = -c(`Cell count.y`))
+# Print the updated data frame
+print(table.inhibitory.byRegion)
+
+ggplot(table.inhibitory.byRegion, aes(x = `Cortical region`, y = `% cells`, fill = `Cell types`)) +
+  geom_bar(stat = "identity") +
+  scale_fill_discrete(name = "Cell types") +  # Custom legend for cell types
+  geom_text(aes(label = paste0(round(`% cells`, 2), "%"), y = `% cells`, group = `Cell types`), 
+            position = position_stack(vjust = 0.5), size = 3) +  # Add % cells text labels
+  labs(title = "Inhibitory Neuron Subtypes by Cortical Region and Cell Types",
+       x = "Cortical Region", y = "% of inhibitory neurons per region") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+## spatial plot ----
+library(cowplot)
+library(grid)
+
+rotate_image <- function(p, rot_angle) {
+  gt <- ggplot_gtable(ggplot_build(p))
+  panel_idx <- which(gt$layout$name == "panel")
+  rot_vp <- viewport(angle = rot_angle)
+  gt[["grobs"]][[panel_idx]] <- editGrob(gt[["grobs"]][[panel_idx]], vp = rot_vp)
+  p_rot <- ggdraw() + draw_grob(gt)
+  
+  return(p_rot)
+}
+
+#pSTG1, rotate 100
+#pSTG2, rotate -10
+#aSTG1, rotate 0
+#aSTG2, rotate 90
+
+
+inh.celltypes <- c("Vip", "Sst", "Pvalb", "Lamp5", "Lamp5 Lhx6")
+excIT.celltypes <- c("L2/3 IT", "L4 IT", "L5 IT", "L6 IT", "L6 IT Car3")
+excNonIT.celltypes <- c("L5 ET", "L5/6 NP", "L6 CT", "L6b", 'L6 IT Car3' ) #leave out L6 IT Car3
+comb.excIT.celltypes <- c("L2/3 IT", "L4 IT", "L5 IT", "L5/6 NP", "L6 CT", "L6b", "L6 IT")
+
+
+#excitatory
+p <- ImageDimPlot(MERFISH, fov = "pSTG1", cells = WhichCells(MERFISH, idents = comb.excIT.celltypes), size = 0.8) + 
+  plot_annotation(title = 'pSTG1')
+ImageDimPlot(MERFISH, fov = "aSTG2", cells = WhichCells(MERFISH, idents = comb.excIT.celltypes), size = 0.8) + 
+  plot_annotation(title = 'aSTG2')
+ImageDimPlot(MERFISH, fov = "aMTG1", cells = WhichCells(MERFISH, idents = comb.excIT.celltypes), size = 0.8) + 
+  plot_annotation(title = 'aMTG1')
+
+ImageDimPlot(MERFISH, fov = "pSTG3", cells = WhichCells(MERFISH, idents = comb.excIT.celltypes), size = 0.8) + 
+  plot_annotation(title = 'pSTG3')
+ImageDimPlot(MERFISH, fov = "pSTG4", cells = WhichCells(MERFISH, idents = comb.excIT.celltypes), size = 0.8) + 
+  plot_annotation(title = 'pSTG4')
+ImageDimPlot(MERFISH, fov = "pSTG5", cells = WhichCells(MERFISH, idents = excNonIT.celltypes), size = 2) + 
+  plot_annotation(title = 'pSTG5')
+
+
+#inhibitory
+ImageDimPlot(MERFISH, fov = "pSTG1", cells = WhichCells(MERFISH, idents = inh.celltypes), size = 0.8) + 
+  plot_annotation(title = 'pSTG1')
+ImageDimPlot(MERFISH, fov = "aSTG2", cells = WhichCells(MERFISH, idents = inh.celltypes), size = 0.8) + 
+  plot_annotation(title = 'aSTG2')
+ImageDimPlot(MERFISH, fov = "aMTG1", cells = WhichCells(MERFISH, idents = inh.celltypes), size = 0.8) + 
+  plot_annotation(title = 'aMTG1')
+
+ImageDimPlot(MERFISH, fov = "pSTG3", cells = WhichCells(MERFISH, idents = inh.celltypes), size = 0.8) + 
+  plot_annotation(title = 'pSTG3')
+ImageDimPlot(MERFISH, fov = "pSTG4", cells = WhichCells(MERFISH, idents = inh.celltypes), size = 0.8) + 
+  plot_annotation(title = 'pSTG4')
+ImageDimPlot(MERFISH, fov = "pSTG5", cells = WhichCells(MERFISH, idents = inh.celltypes), size = 0.8) + 
+  plot_annotation(title = 'pSTG5')
+
+
